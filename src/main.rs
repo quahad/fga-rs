@@ -2,7 +2,7 @@ use bopolyri::{
     mon::Monomial,
     order::{self, DegLex, Lex, MonomialOrdering},
     poly::{self, Polynomial},
-    ring::Ring,
+    ring::{BoxedRing, Ring},
     var::{AssociatedVariableType, Variable},
 };
 use core::num;
@@ -12,13 +12,16 @@ use std::{
     alloc::System,
     collections::{BTreeSet, BinaryHeap, HashMap, LinkedList},
     fmt,
+    fs::{self, File},
+    io::Write,
     marker::PhantomData,
+    rc::Rc,
     time::SystemTime,
     u128,
 };
 
-const NM: usize = 16;
-const NR: usize = 5;
+const NR: usize = 10;
+const NM: usize = 1024;
 const KEY_SIZE: usize = 80;
 const NUM_KEYS: usize = 80 + 8 * NR;
 const NUM_VARS: usize =
@@ -104,15 +107,15 @@ fn main() {
             pos += 1;
         }
     }*/
-    let ring = ring;
+    let ring = &Box::new(ring);
 
-    let mut vars_keys = vec![Polynomial::new(&ring); NUM_KEYS];
-    let mut vars_l = vec![vec![vec![Monomial::new(&ring); 32]; NR]; NM];
-    let mut k = vec![Polynomial::new(&ring); 80];
-    let mut x = vec![vec![Polynomial::<DegLex>::new(&ring); 64]; NM];
-    let mut y = vec![vec![Polynomial::<DegLex>::new(&ring); 64]; NM];
+    let mut vars_keys = vec![Polynomial::new(ring); NUM_KEYS];
+    let mut vars_l = vec![vec![vec![Monomial::new(ring); 32]; NR]; NM];
+    let mut k = vec![Polynomial::new(ring); 80];
+    let mut x = vec![vec![Polynomial::<DegLex>::new(ring); 64]; NM];
+    let mut y = vec![vec![Polynomial::<DegLex>::new(ring); 64]; NM];
     for i in 0..NUM_KEYS {
-        vars_keys[i] = Polynomial::<DegLex>::from_variable(&ring, ring.var(i));
+        vars_keys[i] = Polynomial::<DegLex>::from_variable(ring, ring.var(i));
     }
     for i in 0..80 {
         k[i] = vars_keys[i].clone();
@@ -121,7 +124,7 @@ fn main() {
     for i in 0..NM {
         for j in LIN_ANALYSIS_START_ROUND..=LIN_ANALYSIS_LAST_ROUND {
             for k in 0..INT_BIT_SIZE {
-                vars_l[i][j][k] = Monomial::from_variable(&ring, ring.var(pos));
+                vars_l[i][j][k] = Monomial::from_variable(ring, ring.var(pos));
                 pos += 1;
             }
         }
@@ -159,10 +162,10 @@ fn main() {
     for i in 0..NM {
         for j in 0..64 {
             if list_of_plains[i].0[j] {
-                x[i][j] = Polynomial::one(&ring);
+                x[i][j] = Polynomial::one(ring);
             }
             if list_of_ciphers[i].0[j] {
-                y[i][j] = Polynomial::one(&ring);
+                y[i][j] = Polynomial::one(ring);
             }
         }
     }
@@ -177,16 +180,13 @@ fn main() {
         &excluded_mons,
         true,
         &mut cipher,
-        &ring,
+        ring,
     );
-    for p in polys {
-        println!("{}", p);
-        let m = p.lm().clone();
-        excluded_mons.insert(m);
-        lin_polys.push_back(p);
+    for p in polys.iter() {
+        excluded_mons.insert(p.lm().clone());
+        //println!("{}", p);
     }
-
-    //lin_polys.append(&mut polys);
+    lin_polys.append(&mut polys);
 
     eprintln!("Round by round backward proning.");
     let mut polys = all_lin_analysis_rbyr::<DegLex, _>(
@@ -196,74 +196,70 @@ fn main() {
         &excluded_mons,
         true,
         &mut cipher,
-        &ring,
+        ring,
     );
     for p in polys.iter() {
         excluded_mons.insert(p.lm().clone());
-        println!("{}", p);
+        //println!("{}", p);
     }
     lin_polys.append(&mut polys);
 
-    eprintln!("Total forward proning.");
-    let mut polys = all_lin_analysis_tot::<DegLex, _>(
-        true,
-        &list_of_plains,
-        &vars_l,
-        &excluded_mons,
-        true,
-        &mut cipher,
-        &ring,
-    );
-    for p in polys.iter() {
-        excluded_mons.insert(p.lm().clone());
-        println!("{}", p);
-    }
-    lin_polys.append(&mut polys);
+    // eprintln!("Total forward proning.");lin_polys
+    // let mut polys = all_lin_analysis_tot::<DegLex, _>(
+    //     true,
+    //     &list_of_plains,
+    //     &vars_l,
+    //     &excluded_mons,
+    //     true,
+    //     &mut cipher,
+    //     ring,
+    // );
+    // for p in polys.iter() {
+    //     excluded_mons.insert(p.lm().clone());
+    //     println!("{}", p);
+    // }
+    // lin_polys.append(&mut polys);
 
-    eprintln!("Total backward proning.");
-    let mut polys = all_lin_analysis_tot::<DegLex, _>(
-        false,
-        &list_of_ciphers,
-        &vars_l,
-        &excluded_mons,
-        true,
-        &mut cipher,
-        &ring,
-    );
-    for p in polys.iter() {
-        excluded_mons.insert(p.lm().clone());
-        println!("{}", p);
-    }
-    lin_polys.append(&mut polys);
+    // eprintln!("Total backward proning.");
+    // let mut polys = all_lin_analysis_tot::<DegLex, _>(
+    //     false,
+    //     &list_of_ciphers,
+    //     &vars_l,
+    //     &excluded_mons,
+    //     true,
+    //     &mut cipher,
+    //     ring,
+    // );
+    // for p in polys.iter() {
+    //     excluded_mons.insert(p.lm().clone());
+    //     println!("{}", p);
+    // }
+    // lin_polys.append(&mut polys);
 
     eprintln!(
         "#Total Vars: {}, #Remove Vars: {}",
-        ring.len(),
+        ring.gens(),
         excluded_mons.len()
     );
 
-    let mut eqs = LinkedList::new();
-    aio_encrypt_eqs(&mut eqs, &lin_polys, &k, &x, &y, &vars_keys, &vars_l, &ring);
-    for mut p in eqs {
-        p.justify();
-        println!("{}", p);
+    let mut file = File::create("lin_pols.txt").unwrap();
+    for p in lin_polys.iter() {
+        file.write_all(format!("{}\n", p).as_bytes()).unwrap();
+        //println!("{}", p);
     }
+    //let mut eqs = LinkedList::new();
+    // let mut forward_eqs = LinkedList::new();
+    // for (i, p) in lin_polys.iter().enumerate() {
+    //     if i < 500 {
+    //         forward_eqs.push_back(p.clone());
+    //     }
+    // }
 
-    /*let polys = generate_sample_matrix::<DegLex, _>(
-        false,
-        NUM_VARS + 10240,
-        &list_of_monos,
-        &list_of_ciphers,
-        true,
-        &mut cipher,
-    );
-    for p in polys {
-        println!("{}", p);
-    }*/
-
-    /*for p in eqs {
-        println!("{}", p);
-    }*/
+    //aio_encrypt_eqs(&mut eqs, &lin_polys, &k, &x, &y, &vars_keys, &vars_l, ring);
+    // for mut p in eqs {
+    //     p.justify();
+    //     println!("{}", p);
+    // }
 }
 
 fn num_to_patt(n: usize, patt: &Vec<usize>) -> Message {
@@ -440,7 +436,7 @@ fn mibs_key_round_eqs<'a, O: MonomialOrdering>(
     keqs: &mut LinkedList<Polynomial<'a, O>>,
     rnd: usize,
     stt: &mut Vec<Polynomial<'a, O>>,
-    vars_key: &Vec<Polynomial<'a, O>>,
+    vars_key: &[Polynomial<'a, O>],
 ) {
     let mut t = vec![Polynomial::zero(stt[0].ring()); 80];
     for i in 0..80 {
@@ -467,15 +463,15 @@ fn mibs_key_round_eqs<'a, O: MonomialOrdering>(
 fn aio_encrypt_eqs<'a, O: MonomialOrdering>(
     eqs: &mut LinkedList<Polynomial<'a, O>>,
     forward_eqs: &LinkedList<Polynomial<'a, O>>,
-    k: &Vec<Polynomial<'a, O>>,
-    x: &Vec<Vec<Polynomial<'a, O>>>,
-    y: &Vec<Vec<Polynomial<'a, O>>>,
-    vars_key: &Vec<Polynomial<'a, O>>,
-    vars_l: &Vec<Vec<Vec<Monomial<'a, O>>>>,
-    ring: &'a Ring<O>,
+    k: &[Polynomial<'a, O>],
+    x: &[Vec<Polynomial<'a, O>>],
+    y: &[Vec<Polynomial<'a, O>>],
+    vars_key: &[Polynomial<'a, O>],
+    vars_l: &[Vec<Vec<Monomial<'a, O>>>],
+    ring: &'a BoxedRing<O>,
 ) {
-    let mut stt = k.clone();
-    let mut l = vec![vec![vec![Polynomial::new(&ring); 32]; NR + 2]; NM];
+    let mut stt = k.to_vec();
+    let mut l = vec![vec![vec![Polynomial::new(ring); 32]; NR + 2]; NM];
     for i in 0..NM {
         for j in 0..32 {
             l[i][0][j] = x[i][j].clone();
@@ -485,31 +481,35 @@ fn aio_encrypt_eqs<'a, O: MonomialOrdering>(
         }
         for j in LIN_ANALYSIS_START_ROUND..=LIN_ANALYSIS_LAST_ROUND {
             for k in 0..32 {
-                l[i][j + 1][k] = Polynomial::from_monomial(&ring, vars_l[i][j][k].clone());
+                l[i][j + 1][k] = Polynomial::from_monomial(ring, vars_l[i][j][k].clone());
             }
         }
     }
 
     for p in forward_eqs {
         let m = p.lm();
-        let vars = m.vars().unwrap();
-        if let AssociatedVariableType::L(i, j, k) = vars[0].associated_type() {
-            l[i][j + 1][k] += p;
+        if m.degree() == 1 {
+            let vars = m.vars().unwrap();
+            if let AssociatedVariableType::L(i, j, k) = ring.var(vars[0].order()).associated_type()
+            {
+                //eprintln!("-L: {}", l[i][j + 1][k]);
+                //eprintln!("P: {}", p);
+                l[i][j + 1][k] += p;
+                //eprintln!("+L: {}", l[i][j + 1][k]);
+            }
         }
     }
 
     for i in 0..NR {
-        let mut rk = vec![Polynomial::new(&ring); 32];
+        let mut rk = vec![Polynomial::new(ring); 32];
         mibs_key_round_eqs(eqs, i, &mut stt, &vars_key);
-        for k in 0..32 {
-            rk[k] = stt[48 + k].clone();
-        }
-        for j in 0..NM {
+        rk[..32].clone_from_slice(&stt[48..(32 + 48)]);
+        for l_j in l.iter() {
             let mut tt = rk.clone();
-            let mut t = l[j][i].clone();
+            let mut t = l_j[i].clone();
             for k in 0..32 {
-                tt[k] += &l[j][i + 1][k];
-                t[k] += &l[j][i + 2][k];
+                tt[k] += &l_j[i + 1][k];
+                t[k] += &l_j[i + 2][k];
             }
             let t = mibs_inv_perm(&t);
             let t = mibs_inv_lin(&t);
@@ -520,6 +520,7 @@ fn aio_encrypt_eqs<'a, O: MonomialOrdering>(
                         eqs.push_back(e);
                     }
                 }
+                //eprintln!("- {}, {}, {} -", i, j, k);
             }
         }
     }
@@ -536,6 +537,7 @@ impl MibsCipher {
             round_keys: [0u32; NR],
         }
     }
+
     fn set_key_tap(&mut self, main_key: &[u8], intermediate: &mut [u8]) {
         fn rotr_80_19(n: &mut u128) {
             *n = (*n >> 19) ^ (*n << (80 - 19));
@@ -560,7 +562,8 @@ impl MibsCipher {
         }
     }
 
-    fn M1(a: u32, r1: usize, r2: usize, r3: usize, r4: usize, r5: usize, r6: usize) -> u32 {
+    #[inline]
+    fn m1(a: u32, r1: usize, r2: usize, r3: usize, r4: usize, r5: usize, r6: usize) -> u32 {
         (a << (r1 * 4))
             ^ (a << (r2 * 4))
             ^ (a << (r3 * 4))
@@ -569,21 +572,26 @@ impl MibsCipher {
             ^ (a << (r6 * 4))
     }
 
-    fn M2(a: u32, r1: usize, r2: usize, r3: usize, r4: usize, r5: usize) -> u32 {
+    #[inline]
+    fn m2(a: u32, r1: usize, r2: usize, r3: usize, r4: usize, r5: usize) -> u32 {
         (a << (r1 * 4)) ^ (a << (r2 * 4)) ^ (a << (r3 * 4)) ^ (a << (r4 * 4)) ^ (a << (r5 * 4))
     }
+
+    #[inline]
     fn permute(a: u32) -> u32 {
         let mut res: u32;
-        res = Self::M1(a, 0, 1, 3, 4, 6, 7) & 0xF0000000;
-        res |= (Self::M1(a, 1, 2, 3, 4, 5, 6) >> 4) & 0x0F000000;
-        res |= (Self::M1(a, 0, 1, 2, 4, 5, 7) >> 8) & 0x00F00000;
-        res |= (Self::M2(a, 1, 2, 3, 6, 7) >> 12) & 0x000F0000;
-        res |= (Self::M2(a, 0, 2, 3, 4, 7) >> 16) & 0x0000F000;
-        res |= (Self::M2(a, 0, 1, 3, 4, 5) >> 20) & 0x00000F00;
-        res |= (Self::M2(a, 0, 1, 2, 5, 6) >> 24) & 0x000000F0;
-        res |= (Self::M1(a, 0, 2, 3, 5, 6, 7) >> 28) & 0x000000F;
+        res = Self::m1(a, 0, 1, 3, 4, 6, 7) & 0xF0000000;
+        res |= (Self::m1(a, 1, 2, 3, 4, 5, 6) >> 4) & 0x0F000000;
+        res |= (Self::m1(a, 0, 1, 2, 4, 5, 7) >> 8) & 0x00F00000;
+        res |= (Self::m2(a, 1, 2, 3, 6, 7) >> 12) & 0x000F0000;
+        res |= (Self::m2(a, 0, 2, 3, 4, 7) >> 16) & 0x0000F000;
+        res |= (Self::m2(a, 0, 1, 3, 4, 5) >> 20) & 0x00000F00;
+        res |= (Self::m2(a, 0, 1, 2, 5, 6) >> 24) & 0x000000F0;
+        res |= (Self::m1(a, 0, 2, 3, 5, 6, 7) >> 28) & 0x000000F;
         res
     }
+
+    #[inline]
     fn round_f(left: u32, round_key: u32, tap: &mut u32) -> u32 {
         *tap = left;
         let mut xor_data = left ^ round_key;
@@ -599,6 +607,7 @@ impl MibsCipher {
         }
         Self::permute(out)
     }
+
     fn encrypt_tap(&self, nr: usize, plain: u64, intermediate: &mut [u32]) -> u64 {
         let mut left = (plain >> 32) as u32;
         let mut right = plain as u32;
@@ -634,20 +643,23 @@ impl MibsCipher {
 
 #[derive(Clone)]
 struct Message(FixedBitSet);
+
 #[derive(Clone)]
 struct IntermediateData(FixedBitSet);
+
 #[derive(Clone)]
 struct Key(FixedBitSet);
 
 trait Cipher: Sized {
     fn set_random_key(&mut self) -> Key;
     fn set_zero_key(&mut self) -> Key;
-    fn generate_forward_sample(&mut self, zz: &Vec<Message>, sample: &mut Sample<Self>);
-    fn generate_backward_sample(&mut self, zz: &Vec<Message>, sample: &mut Sample<Self>);
+    fn generate_forward_sample(&mut self, zz: &[Message], sample: &mut Sample<Self>);
+    fn generate_backward_sample(&mut self, zz: &[Message], sample: &mut Sample<Self>);
     fn block_len() -> usize;
     fn key_len() -> usize;
     fn intermediate_len() -> usize;
 }
+
 struct Sample<C> {
     key: Key,
     x: Vec<Message>,
@@ -669,13 +681,18 @@ impl<C: Cipher> Sample<C> {
             _marker: PhantomData,
         }
     }
-    fn apply_monomial<'a, O: MonomialOrdering>(&self, mon: &Monomial<'a, O>) -> bool {
+
+    fn apply_monomial<'a, O: MonomialOrdering>(&self, mon: &Monomial<O>) -> bool {
         let mut ans = true;
         if mon.is_zero() {
             return false;
         }
+        if mon.is_one() {
+            return true;
+        }
+        let ring = mon.ring().unwrap();
         if let Some(vars) = mon.vars() {
-            let iter = vars.iter();
+            let iter = vars.iter().map(|v| ring.var(v.order()));
             for v in iter {
                 match v.associated_type() {
                     AssociatedVariableType::K(i) => {
@@ -718,11 +735,10 @@ impl Cipher for MibsCipher {
                 key_u8[i / 8] ^= 0x1 << (i % 8);
             }
         }
-        self.set_key_tap(&mut key_u8, &mut inter);
-        for i in 0..NR {
+        self.set_key_tap(&key_u8, &mut inter);
+        for (i, d) in inter.iter().enumerate() {
             for j in 0..8 {
-                key.0
-                    .set(KEY_SIZE + i * 8 + j, (inter[i] & (0x1 << j)) != 0);
+                key.0.set(KEY_SIZE + i * 8 + j, (d & (0x1 << j)) != 0);
             }
         }
         key
@@ -740,51 +756,71 @@ impl Cipher for MibsCipher {
                 key_u8[i / 8] ^= 0x1 << (i % 8);
             }
         }
-        self.set_key_tap(&mut key_u8, &mut inter);
-        for i in 0..NR {
+        self.set_key_tap(&key_u8, &mut inter);
+        for (i, d) in inter.iter().enumerate() {
             for j in 0..8 {
-                key.0
-                    .set(KEY_SIZE + i * 8 + j, (inter[i] & (0x1 << j)) != 0);
+                key.0.set(KEY_SIZE + i * 8 + j, (d & (0x1 << j)) != 0);
             }
         }
         key
     }
 
-    fn generate_forward_sample(&mut self, zz: &Vec<Message>, sample: &mut Sample<MibsCipher>) {
+    fn generate_forward_sample(&mut self, zz: &[Message], sample: &mut Sample<MibsCipher>) {
         sample
             .x
             .resize_with(zz.len(), || Message(FixedBitSet::with_capacity(64)));
         sample.x.clone_from_slice(zz);
-        for i in 0..zz.len() {
+        for (i, msg) in zz.iter().enumerate() {
             let mut inter = [0u32; NR];
-            let x = (zz[i].0.as_slice()[0] as u64) ^ (zz[i].0.as_slice()[1] as u64) << 32;
+            let x = (msg.0.as_slice()[0] as u64) ^ (msg.0.as_slice()[1] as u64) << 32;
             self.encrypt_tap(NR, x, &mut inter);
-            for j in 0..NR {
-                sample.d[i][j].0.as_mut_slice()[0] = inter[j];
+            for (j, d) in inter.iter().enumerate() {
+                sample.d[i][j].0.as_mut_slice()[0] = *d;
             }
         }
     }
-    fn generate_backward_sample(&mut self, zz: &Vec<Message>, sample: &mut Sample<MibsCipher>) {
+
+    fn generate_backward_sample(&mut self, zz: &[Message], sample: &mut Sample<MibsCipher>) {
         sample.y.clone_from_slice(zz);
-        for i in 0..zz.len() {
+        for (i, msg) in zz.iter().enumerate() {
             let mut inter = [0u32; NR];
-            let y = (zz[i].0.as_slice()[1] as u64) ^ (zz[i].0.as_slice()[0] as u64) << 32;
+            let y = (msg.0.as_slice()[1] as u64) ^ (msg.0.as_slice()[0] as u64) << 32;
             self.decrypt_tap(NR, y, &mut inter);
-            for j in 0..NR {
-                sample.d[i][j].0.as_mut_slice()[0] = inter[j];
+            for (j, d) in inter.iter().enumerate() {
+                sample.d[i][j].0.as_mut_slice()[0] = *d;
             }
         }
     }
 }
 
 const EXECIVE_SAMPLES: usize = 256;
-fn generate_sample_matrix<'a, O: MonomialOrdering, C: Cipher>(
+fn generate_samples<C: Cipher>(
     is_forward: bool,
-    list_of_monos: &Vec<Monomial<'a, O>>,
-    list_of_messages: &Vec<Message>,
+    list_of_messages: &[Message],
     print: bool,
     cipher: &mut C,
-    ring: &'a Ring<O>,
+)->Vec<Sample<C>>{
+    let zz = list_of_messages;
+    let num_samples = 2* NM*C::intermediate_len();
+    let mut samples = Vec::with_capacity(num_samples);
+    samples.resize_with(num_samples,||{let mut smp = Sample::<C>::new(NM);
+        smp.key = cipher.set_random_key();
+        if is_forward {
+            cipher.generate_forward_sample(&zz, &mut smp);
+        } else {
+            cipher.generate_backward_sample(&zz, &mut smp);
+        }
+    smp});
+    samples
+}
+
+fn generate_sample_matrix<'a, O: MonomialOrdering, C: Cipher>(
+    is_forward: bool,
+    list_of_monos: &[Monomial<'a, O>],
+    list_of_messages: &[Message],
+    print: bool,
+    cipher: &mut C,
+    ring: &'a BoxedRing<O>,
 ) -> LinkedList<Polynomial<'a, O>> {
     let zz = list_of_messages;
     let dim_samples = list_of_monos.len();
@@ -797,19 +833,20 @@ fn generate_sample_matrix<'a, O: MonomialOrdering, C: Cipher>(
             dim_samples + num_samples
         );
     }
+    let mut smp = Sample::<C>::new(NM);
     for i in 0..num_samples {
-        let mut smp = Sample::<C>::new(NM);
         smp.key = cipher.set_random_key();
         if is_forward {
             cipher.generate_forward_sample(&zz, &mut smp);
         } else {
             cipher.generate_backward_sample(&zz, &mut smp);
         }
-        for j in 0..dim_samples {
-            let v = smp.apply_monomial(&list_of_monos[j]);
+        for (j, m) in list_of_monos.iter().enumerate() {
+            let v = smp.apply_monomial(m);
             mat.set_bit(j, i, v);
         }
     }
+    let mat_time = SystemTime::now();
 
     for i in 0..dim_samples {
         mat.set_bit(i, num_samples + i, true);
@@ -820,7 +857,15 @@ fn generate_sample_matrix<'a, O: MonomialOrdering, C: Cipher>(
     mat.echelonize_full();
     let wnd = mat.get_window(0, 0, dim_samples, num_samples);
     let rank = wnd.rank();
-
+    if print {
+        eprintln!("Matrix Rank: {}", rank);
+    }
+    if print {
+        eprintln!(
+            "Matrix Time: {} s",
+            mat_time.elapsed().unwrap().as_secs_f32()
+        );
+    }
     let mut res = LinkedList::new();
     for i in rank..dim_samples {
         let mut poly = Polynomial::<O>::zero(ring);
@@ -838,12 +883,12 @@ fn generate_sample_matrix<'a, O: MonomialOrdering, C: Cipher>(
 
 fn all_lin_analysis_rbyr<'a, O: MonomialOrdering, C: Cipher>(
     is_forward: bool,
-    list_of_messages: &Vec<Message>,
+    list_of_messages: &[Message],
     vars_l: &Vec<Vec<Vec<Monomial<'a, O>>>>,
     excluded_mons: &BTreeSet<Monomial<'a, O>>,
     print: bool,
     cipher: &mut C,
-    ring: &'a Ring<O>,
+    ring: &'a BoxedRing<O>,
 ) -> LinkedList<Polynomial<'a, O>> {
     let tot_time = SystemTime::now();
     let mut vars = Vec::new();
@@ -879,7 +924,7 @@ fn all_lin_analysis_rbyr<'a, O: MonomialOrdering, C: Cipher>(
         if print {
             eprintln!("---------");
             eprintln!(
-                "Rnd: {}, #eqs: {} , duration: {}",
+                "Rnd: {}, #eqs: {} , duration: {} s",
                 i,
                 new_pols,
                 time.elapsed().unwrap().as_secs_f32()
@@ -899,22 +944,23 @@ fn all_lin_analysis_rbyr<'a, O: MonomialOrdering, C: Cipher>(
 
     eqs
 }
+
 fn all_lin_analysis_tot<'a, O: 'a + MonomialOrdering, C: Cipher>(
     is_forward: bool,
-    list_of_messages: &Vec<Message>,
-    vars_l: &Vec<Vec<Vec<Monomial<'a, O>>>>,
+    list_of_messages: &[Message],
+    vars_l: &[Vec<Vec<Monomial<'a, O>>>],
     excluded_mons: &BTreeSet<Monomial<'a, O>>,
     print: bool,
     cipher: &mut C,
-    ring: &'a Ring<O>,
+    ring: &'a BoxedRing<O>,
 ) -> LinkedList<Polynomial<'a, O>> {
     let tot_time = SystemTime::now();
     let mut vars = Vec::new();
-    for i in LIN_ANALYSIS_START_ROUND..=LIN_ANALYSIS_LAST_ROUND {
-        for k in 0..NM {
-            for j in 0..C::intermediate_len() {
-                if !excluded_mons.contains(&vars_l[k][i][j]) {
-                    vars.push(vars_l[k][i][j].clone());
+    for iter_nm in vars_l.iter() {
+        for iter_nr in iter_nm.iter() {
+            for v in iter_nr.iter() {
+                if !excluded_mons.contains(v) {
+                    vars.push(v.clone());
                 }
             }
         }
