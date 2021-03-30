@@ -8,22 +8,23 @@ use bopolyri::{
 use core::num;
 use fixedbitset::FixedBitSet;
 use m4ri_rust::friendly::BinMatrix;
-use rand::prelude::SliceRandom;
-use std::cmp::min;
+use rand::{prelude::SliceRandom, seq::index::sample, Rng};
+use serde::{ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     alloc::System,
     collections::{BTreeSet, BinaryHeap, HashMap, LinkedList},
     fmt,
     fs::{self, File},
-    io::Write,
+    io::{Read, Seek, Write},
     marker::PhantomData,
     rc::Rc,
     time::SystemTime,
-    u128,
+    u128, usize,
 };
+use std::{cmp::min, iter::FromIterator};
 use sysinfo::{ProcessExt, SystemExt};
 
-const NR: usize = 10;
+const NR: usize = 7;
 const NM: usize = 2048;
 const KEY_SIZE: usize = 80;
 const NUM_KEYS: usize = 80 + 8 * NR;
@@ -110,6 +111,7 @@ fn main() {
             pos += 1;
         }
     }*/
+
     let ring = &Box::new(ring);
 
     let mut vars_keys = vec![Polynomial::new(ring); NUM_KEYS];
@@ -174,20 +176,36 @@ fn main() {
     }
 
     eprintln!("Round by round forward proning.");
+    let samples_db = sled::Config::default()
+        .cache_capacity(10 * 1024 * 1024)
+        .path("forward-sample-db")
+        .open()
+        .expect("open");
+    //let samples_db = sled::open("forward-sample-db").expect("open");
+    let samples_tree = samples_db
+        .open_tree("small-forward-sample-db")
+        .expect("open");
     let s = sysinfo::System::new_all();
     let pid = std::process::id();
     let cur_proc = s.get_process(pid as i32).unwrap();
-    
 
     let mut excluded_mons = BTreeSet::new();
     let mut lin_polys = LinkedList::new();
 
     let num_samples = 2 * CHUNK_SIZE * MibsCipher::intermediate_len();
     let samples = generate_samples(true, &list_of_plains, true, &mut cipher, num_samples);
+    // generate_samples_db(
+    //     true,
+    //     &list_of_plains,
+    //     true,
+    //     &mut cipher,
+    //     num_samples,
+    //     samples_tree.clone(),
+    // );
 
     eprintln!("Small chunk.");
-    println!("Cur mem usage: {} kb", cur_proc.memory());
-    let (mut polys,num_found_pols) = all_lin_analysis_rbyr_chunk::<DegLex, _>(
+    eprintln!("Cur mem usage: {} kb", cur_proc.memory());
+    let (mut polys, num_found_pols) = all_lin_analysis_rbyr_chunk::<DegLex, _>(
         &samples,
         &vars_l,
         &excluded_mons,
@@ -195,23 +213,60 @@ fn main() {
         ring,
         CHUNK_SIZE,
     );
+    // let (mut polys, num_found_pols) = all_lin_analysis_rbyr_chunk_db::<DegLex, MibsCipher>(
+    //     samples_tree.clone(),
+    //     &vars_l,
+    //     &excluded_mons,
+    //     true,
+    //     ring,
+    //     CHUNK_SIZE,
+    // );
     for p in polys.iter() {
         excluded_mons.insert(p.lm().clone());
         //println!("{}", p);
     }
     lin_polys.append(&mut polys);
-    println!("Cur mem usage: {} kb", cur_proc.memory());
-    println!("#Linear Polynomials: {}",lin_polys.len());
-
+    eprintln!("Cur mem usage: {} kb", cur_proc.memory());
+    eprintln!("#Linear Polynomials: {}", lin_polys.len());
 
     eprintln!("Total chunk.");
-    println!("Cur mem usage: {} kb", cur_proc.memory());
-    let max_req_samples = num_found_pols.iter().map(|n| {let  n = NM * MibsCipher::intermediate_len() - n;
-    println!("{}",n);n}).max().unwrap();
-    let num_samples = 5*max_req_samples/4;
-    let samples = generate_samples(true, &list_of_plains, true, &mut cipher, num_samples);
-    let mut polys =
-        all_lin_analysis_rbyr::<DegLex, _>(&samples, &vars_l, &excluded_mons, true, ring);
+    eprintln!("Cur mem usage: {} kb", cur_proc.memory());
+    let max_req_samples = num_found_pols
+        .iter()
+        .map(|n| {
+            let n = NM * MibsCipher::intermediate_len() - n;
+            println!("{}", n);
+            n
+        })
+        .max()
+        .unwrap();
+    let num_samples = 5 * max_req_samples / 4;
+
+    //let samples = generate_samples(true, &list_of_plains, true, &mut cipher, num_samples);
+    let samples_tree = samples_db
+        .open_tree("large-forward-sample-db")
+        .expect("open");
+    generate_samples_db(
+        true,
+        &list_of_plains,
+        true,
+        &mut cipher,
+        num_samples,
+        samples_tree.clone(),
+    );
+
+    eprintln!("Samples generated.");
+    eprintln!("Cur mem usage: {} kb", cur_proc.memory());
+
+    //let mut polys =
+    //    all_lin_analysis_rbyr::<DegLex, _>(&samples, &vars_l, &excluded_mons, true, ring);
+    let mut polys = all_lin_analysis_rbyr_db::<DegLex, MibsCipher>(
+        samples_tree,
+        &vars_l,
+        &excluded_mons,
+        true,
+        ring,
+    );
     for p in polys.iter() {
         excluded_mons.insert(p.lm().clone());
         //println!("{}", p);
@@ -244,8 +299,6 @@ fn main() {
     // }
     // lin_polys.append(&mut polys);
 
-    // eprintln!("Total backward proning.");
-    // let mut polys = all_lin_analysis_tot::<DegLex, _>(
     //     false,
     //     &list_of_ciphers,
     //     &vars_l,
@@ -667,12 +720,96 @@ impl MibsCipher {
 
 #[derive(Clone)]
 struct Message(FixedBitSet);
+impl Serialize for Message {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let blocks = self.0.as_slice();
+        let mut seq = serializer.serialize_seq(Some(blocks.len() + 1))?;
+        for e in blocks {
+            seq.serialize_element(e)?;
+        }
+        seq.serialize_element(&(self.0.len() as u32))?;
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D>(deserializer: D) -> Result<Message, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut blocks: Vec<u32> = Deserialize::deserialize(deserializer)?;
+        let bits = blocks.pop().unwrap();
+        Ok(Message(FixedBitSet::with_capacity_and_blocks(
+            bits as usize,
+            blocks,
+        )))
+    }
+}
 
 #[derive(Clone)]
 struct IntermediateData(FixedBitSet);
+impl Serialize for IntermediateData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let blocks = self.0.as_slice();
+        let mut seq = serializer.serialize_seq(Some(blocks.len() + 1))?;
+        for e in blocks {
+            seq.serialize_element(e)?;
+        }
+        seq.serialize_element(&(self.0.len() as u32))?;
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for IntermediateData {
+    fn deserialize<D>(deserializer: D) -> Result<IntermediateData, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut blocks: Vec<u32> = Deserialize::deserialize(deserializer)?;
+        let bits = blocks.pop().unwrap();
+        Ok(IntermediateData(FixedBitSet::with_capacity_and_blocks(
+            bits as usize,
+            blocks,
+        )))
+    }
+}
 
 #[derive(Clone)]
 struct Key(FixedBitSet);
+impl Serialize for Key {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let blocks = self.0.as_slice();
+        let mut seq = serializer.serialize_seq(Some(blocks.len() + 1))?;
+        for e in blocks {
+            seq.serialize_element(e)?;
+        }
+        seq.serialize_element(&(self.0.len() as u32))?;
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Key {
+    fn deserialize<D>(deserializer: D) -> Result<Key, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut blocks: Vec<u32> = Deserialize::deserialize(deserializer)?;
+        let bits = blocks.pop().unwrap();
+        Ok(Key(FixedBitSet::with_capacity_and_blocks(
+            bits as usize,
+            blocks,
+        )))
+    }
+}
 
 trait Cipher: Sized {
     fn set_random_key(&mut self) -> Key;
@@ -684,6 +821,7 @@ trait Cipher: Sized {
     fn intermediate_len() -> usize;
 }
 
+#[derive(Serialize, Deserialize)]
 struct Sample<C> {
     key: Key,
     x: Vec<Message>,
@@ -841,6 +979,31 @@ fn generate_samples<C: Cipher>(
     samples
 }
 
+fn generate_samples_db<C: Cipher>(
+    is_forward: bool,
+    list_of_messages: &[Message],
+    print: bool,
+    cipher: &mut C,
+    num_samples: usize,
+    tree: sled::Tree,
+) {
+    let zz = list_of_messages;
+    let mut smp = Sample::<C>::new(NM);
+    for i in 0..num_samples {
+        smp.key = cipher.set_random_key();
+        if is_forward {
+            cipher.generate_forward_sample(&zz, &mut smp);
+        } else {
+            cipher.generate_backward_sample(&zz, &mut smp);
+        }
+        tree.insert(&i.to_le_bytes(), bincode::serialize(&smp).unwrap());
+        if (i + 1) % 10 * CHUNK_SIZE == 0 {
+            eprintln!("{}", i);
+            tree.flush();
+        }
+    }
+}
+
 fn prone_polynomials<'a, O: MonomialOrdering, C: Cipher>(
     list_of_monos: &[Monomial<'a, O>],
     list_of_samples: &[Sample<C>],
@@ -900,6 +1063,72 @@ fn prone_polynomials<'a, O: MonomialOrdering, C: Cipher>(
     res
 }
 
+fn prone_polynomials_db<'a, O: MonomialOrdering, C: Cipher>(
+    list_of_monos: &[Monomial<'a, O>],
+    samples: sled::Tree,
+    print: bool,
+    ring: &'a BoxedRing<O>,
+) -> LinkedList<Polynomial<'a, O>> {
+    let mut rng = &mut rand::thread_rng();
+    let dim_samples = list_of_monos.len();
+    let num_samples = ((dim_samples + EXECIVE_SAMPLES + 127) / 128) * 128;
+    let (idx, _) = samples.last().unwrap().unwrap();
+    let mut t = [0; 8];
+    t.copy_from_slice(&idx);
+    let idx = usize::from_le_bytes(t);
+    eprintln!("#db size: {}, #samples: {}", idx + 1, num_samples);
+    let idxes = sample(rng, idx + 1, num_samples);
+    let mut mat = BinMatrix::zero(dim_samples, dim_samples + num_samples);
+    if print {
+        eprintln!(
+            "Matrix size: {} x {}",
+            dim_samples,
+            dim_samples + num_samples
+        );
+    }
+    for (i, idx) in idxes.iter().enumerate() {
+        let smp = samples.get(idx.to_le_bytes()).unwrap().unwrap();
+        let smp: Sample<C> = bincode::deserialize(&smp).unwrap();
+        for (j, m) in list_of_monos.iter().enumerate() {
+            let v = smp.apply_monomial(m);
+            mat.set_bit(j, i, v);
+        }
+    }
+    let mat_time = SystemTime::now();
+
+    for i in 0..dim_samples {
+        mat.set_bit(i, num_samples + i, true);
+    }
+    if print {
+        eprintln!("Echelonizing matrix")
+    }
+    mat.echelonize_full();
+    let wnd = mat.get_window(0, 0, dim_samples, num_samples);
+    let rank = wnd.rank();
+    if print {
+        eprintln!("Matrix Rank: {}", rank);
+    }
+    if print {
+        eprintln!(
+            "Matrix Time: {} s",
+            mat_time.elapsed().unwrap().as_secs_f32()
+        );
+    }
+    let mut res = LinkedList::new();
+    for i in rank..dim_samples {
+        let mut poly = Polynomial::<O>::zero(ring);
+        for j in num_samples..num_samples + dim_samples {
+            if mat.bit(i, j) {
+                poly += &list_of_monos[j - num_samples];
+            }
+        }
+        if !poly.is_zero() {
+            res.push_back(poly);
+        }
+    }
+    res
+}
+
 fn all_lin_analysis_rbyr_chunk<'a, O: MonomialOrdering, C: Cipher>(
     list_of_samples: &[Sample<C>],
     vars_l: &Vec<Vec<Vec<Monomial<'a, O>>>>,
@@ -907,13 +1136,13 @@ fn all_lin_analysis_rbyr_chunk<'a, O: MonomialOrdering, C: Cipher>(
     print: bool,
     ring: &'a BoxedRing<O>,
     chunk_size: usize,
-) -> (LinkedList<Polynomial<'a, O>>,Vec<usize>) {
+) -> (LinkedList<Polynomial<'a, O>>, Vec<usize>) {
     let tot_time = SystemTime::now();
     let mut vars = Vec::new();
     let mut eqs = LinkedList::new();
     let num_chunks = (NM + chunk_size - 1) / chunk_size;
     let mut num_found_pols = Vec::new();
-    num_found_pols.resize(NR,0);
+    num_found_pols.resize(NR, 0);
     for i in LIN_ANALYSIS_START_ROUND..=LIN_ANALYSIS_LAST_ROUND {
         for kk in 0..num_chunks {
             let time = SystemTime::now();
@@ -935,7 +1164,7 @@ fn all_lin_analysis_rbyr_chunk<'a, O: MonomialOrdering, C: Cipher>(
                 //excluded_mons.insert(p.lm().clone());
                 eqs.push_back(p);
             }
-            num_found_pols[i]+=new_pols;
+            num_found_pols[i] += new_pols;
 
             if print {
                 eprintln!("---------");
@@ -959,7 +1188,69 @@ fn all_lin_analysis_rbyr_chunk<'a, O: MonomialOrdering, C: Cipher>(
         eprintln!("---------");
     }
 
-    (eqs,num_found_pols)
+    (eqs, num_found_pols)
+}
+
+fn all_lin_analysis_rbyr_chunk_db<'a, O: MonomialOrdering, C: Cipher>(
+    samples: sled::Tree,
+    vars_l: &Vec<Vec<Vec<Monomial<'a, O>>>>,
+    excluded_mons: &BTreeSet<Monomial<'a, O>>,
+    print: bool,
+    ring: &'a BoxedRing<O>,
+    chunk_size: usize,
+) -> (LinkedList<Polynomial<'a, O>>, Vec<usize>) {
+    let tot_time = SystemTime::now();
+    let mut vars = Vec::new();
+    let mut eqs = LinkedList::new();
+    let num_chunks = (NM + chunk_size - 1) / chunk_size;
+    let mut num_found_pols = Vec::new();
+    num_found_pols.resize(NR, 0);
+    for i in LIN_ANALYSIS_START_ROUND..=LIN_ANALYSIS_LAST_ROUND {
+        for kk in 0..num_chunks {
+            let time = SystemTime::now();
+            vars.clear();
+            for k in (kk * chunk_size)..min((kk + 1) * chunk_size, NM) {
+                for j in 0..C::intermediate_len() {
+                    if !excluded_mons.contains(&vars_l[k][i][j]) {
+                        vars.push(vars_l[k][i][j].clone());
+                    }
+                }
+            }
+            vars.push(Monomial::one(ring));
+            vars.sort();
+            vars.reverse();
+
+            let mut teqs = prone_polynomials_db::<O, C>(&vars, samples.clone(), print, ring);
+            let new_pols = teqs.len();
+            for p in teqs {
+                //excluded_mons.insert(p.lm().clone());
+                eqs.push_back(p);
+            }
+            num_found_pols[i] += new_pols;
+
+            if print {
+                eprintln!("---------");
+                eprintln!(
+                    "Rnd: {}, #eqs: {} , duration: {} s",
+                    i,
+                    new_pols,
+                    time.elapsed().unwrap().as_secs_f32()
+                );
+                eprintln!("---------");
+            }
+        }
+    }
+    if print {
+        eprintln!("---------");
+        eprintln!(
+            "#Tot eqs: {} , duration: {} ",
+            eqs.len(),
+            tot_time.elapsed().unwrap().as_secs_f32()
+        );
+        eprintln!("---------");
+    }
+
+    (eqs, num_found_pols)
 }
 
 fn all_lin_analysis_rbyr<'a, O: MonomialOrdering, C: Cipher>(
@@ -987,6 +1278,61 @@ fn all_lin_analysis_rbyr<'a, O: MonomialOrdering, C: Cipher>(
         vars.reverse();
 
         let mut teqs = prone_polynomials::<O, C>(&vars, list_of_samples, print, ring);
+        let new_pols = teqs.len();
+        for p in teqs {
+            //excluded_mons.insert(p.lm().clone());
+            eqs.push_back(p);
+        }
+
+        if print {
+            eprintln!("---------");
+            eprintln!(
+                "Rnd: {}, #eqs: {} , duration: {} s",
+                i,
+                new_pols,
+                time.elapsed().unwrap().as_secs_f32()
+            );
+            eprintln!("---------");
+        }
+    }
+    if print {
+        eprintln!("---------");
+        eprintln!(
+            "#Tot eqs: {} , duration: {} ",
+            eqs.len(),
+            tot_time.elapsed().unwrap().as_secs_f32()
+        );
+        eprintln!("---------");
+    }
+
+    eqs
+}
+
+fn all_lin_analysis_rbyr_db<'a, O: MonomialOrdering, C: Cipher>(
+    samples: sled::Tree,
+    vars_l: &Vec<Vec<Vec<Monomial<'a, O>>>>,
+    excluded_mons: &BTreeSet<Monomial<'a, O>>,
+    print: bool,
+    ring: &'a BoxedRing<O>,
+) -> LinkedList<Polynomial<'a, O>> {
+    let tot_time = SystemTime::now();
+    let mut vars = Vec::new();
+    let mut eqs = LinkedList::new();
+    for i in LIN_ANALYSIS_START_ROUND..=LIN_ANALYSIS_LAST_ROUND {
+        let time = SystemTime::now();
+        vars.clear();
+        for k in 0..NM {
+            for j in 0..C::intermediate_len() {
+                if !excluded_mons.contains(&vars_l[k][i][j]) {
+                    vars.push(vars_l[k][i][j].clone());
+                }
+            }
+        }
+        vars.push(Monomial::one(ring));
+        vars.sort();
+        vars.reverse();
+
+        let mut teqs = prone_polynomials_db::<O, C>(&vars, samples.clone(), print, ring);
         let new_pols = teqs.len();
         for p in teqs {
             //excluded_mons.insert(p.lm().clone());
@@ -1051,4 +1397,35 @@ fn all_lin_analysis_tot<'a, O: 'a + MonomialOrdering, C: Cipher>(
         eprintln!("---------");
     }
     eqs
+}
+
+struct DiskVec {
+    indexes: Vec<(usize, usize)>,
+    file: fs::File,
+}
+
+impl DiskVec {
+    fn new<P: Into<PathBuf>>(path: P) -> std::io::Result<DiskVec> {
+        let res = DiskVec {
+            indexes: Vec::new(),
+            file: fs::File::create(path)?,
+        };
+        Ok(res)
+    }
+
+    fn get(&mut self, index: usize) -> Vec<u8> {
+        let (pos, len) = self.indexes[index];
+        self.file.seek(pos).unwrap();
+        let mut buf = vec![0; pos];
+        self.file.read_exact(&mut buf).unwrap();
+        buf
+    }
+
+    fn push(&mut self, data: &[u8]) {
+        self.file.seek(SeekFrom::End(0)).unwrap();
+        let pos = self.file.stream_position().unwrap();
+        self.file.write_all(data).unwrap();
+        let len = data.len();
+        self.indexes.push((pos, len));
+    }
 }
