@@ -9,7 +9,8 @@ use core::num;
 use fixedbitset::FixedBitSet;
 use m4ri_rust::friendly::BinMatrix;
 use rand::prelude::SliceRandom;
-use std::cmp::min;
+use rayon::iter::IntoParallelIterator;
+use rayon::iter::ParallelIterator;
 use std::{
     alloc::System,
     collections::{BTreeSet, BinaryHeap, HashMap, LinkedList},
@@ -21,10 +22,14 @@ use std::{
     time::SystemTime,
     u128,
 };
+use std::{
+    cmp::min,
+    sync::{Arc, Mutex},
+};
 use sysinfo::{ProcessExt, SystemExt};
 
 const NR: usize = 10;
-const NM: usize = 2048;
+const NM: usize = 4096;
 const KEY_SIZE: usize = 80;
 const NUM_KEYS: usize = 80 + 8 * NR;
 const NUM_VARS: usize =
@@ -33,7 +38,9 @@ const INT_BIT_SIZE: usize = 32;
 const ORDERING: DegLex = DegLex;
 const LIN_ANALYSIS_START_ROUND: usize = 1;
 const LIN_ANALYSIS_LAST_ROUND: usize = NR - 2;
-const CHUNK_SIZE: usize = 16;
+const CHUNK_SIZE: usize = 1024;
+const PAR_CHUNK_SIZE: usize = 512;
+
 fn main() {
     // println!("Hello, world!");
     // let ordering = DegLex;
@@ -177,18 +184,21 @@ fn main() {
     let s = sysinfo::System::new_all();
     let pid = std::process::id();
     let cur_proc = s.get_process(pid as i32).unwrap();
-    
 
     let mut excluded_mons = BTreeSet::new();
-    let mut lin_polys = LinkedList::new();
+    //let mut lin_polys = LinkedList::new();
 
     let num_samples = 2 * CHUNK_SIZE * MibsCipher::intermediate_len();
-    let samples = generate_samples(true, &list_of_plains, true, &mut cipher, num_samples);
+    //let samples = generate_samples(true, &list_of_plains, true, &mut cipher, num_samples);
+
+    let mut file = File::create("lin_pols.txt").unwrap();
 
     eprintln!("Small chunk.");
     println!("Cur mem usage: {} kb", cur_proc.memory());
-    let (mut polys,num_found_pols) = all_lin_analysis_rbyr_chunk::<DegLex, _>(
-        &samples,
+    let (mut polys, num_found_pols) = all_lin_analysis_rbyr_chunk::<DegLex, _>(
+        &mut cipher,
+        &list_of_plains,
+        true,
         &vars_l,
         &excluded_mons,
         true,
@@ -198,25 +208,43 @@ fn main() {
     for p in polys.iter() {
         excluded_mons.insert(p.lm().clone());
         //println!("{}", p);
+        file.write_all(format!("{}\n", p).as_bytes()).unwrap();
     }
-    lin_polys.append(&mut polys);
+    drop(polys);
+    //lin_polys.append(&mut polys);
     println!("Cur mem usage: {} kb", cur_proc.memory());
-    println!("#Linear Polynomials: {}",lin_polys.len());
-
+    println!("#Linear Polynomials: {}", excluded_mons.len());
 
     eprintln!("Total chunk.");
     println!("Cur mem usage: {} kb", cur_proc.memory());
-    let max_req_samples = num_found_pols.iter().map(|n| {let  n = NM * MibsCipher::intermediate_len() - n;
-    println!("{}",n);n}).max().unwrap();
-    let num_samples = 5*max_req_samples/4;
-    let samples = generate_samples(true, &list_of_plains, true, &mut cipher, num_samples);
-    let mut polys =
-        all_lin_analysis_rbyr::<DegLex, _>(&samples, &vars_l, &excluded_mons, true, ring);
-    for p in polys.iter() {
+    let max_req_samples = num_found_pols
+        .iter()
+        .map(|n| {
+            let n = NM * MibsCipher::intermediate_len() - n;
+            println!("{}", n);
+            n
+        })
+        .max()
+        .unwrap();
+    //let num_samples = 5 * max_req_samples / 4;
+    //let samples = generate_samples(true, &list_of_plains, true, &mut cipher, num_samples);
+    let mut polys = all_lin_analysis_rbyr::<DegLex, _>(
+        &mut cipher,
+        &list_of_plains,
+        true,
+        &vars_l,
+        &excluded_mons,
+        true,
+        ring,
+    );
+
+     for p in polys.iter() {
         excluded_mons.insert(p.lm().clone());
+        file.write_all(format!("{}\n", p).as_bytes()).unwrap();
         //println!("{}", p);
     }
-    lin_polys.append(&mut polys);
+    drop(polys); 
+    //lin_polys.append(&mut polys);
 
     // eprintln!("Round by round backward proning.");
     // let samples = generate_samples(false, &list_of_ciphers, true, &mut cipher);
@@ -266,11 +294,10 @@ fn main() {
         excluded_mons.len()
     );
 
-    let mut file = File::create("lin_pols.txt").unwrap();
-    for p in lin_polys.iter() {
-        file.write_all(format!("{}\n", p).as_bytes()).unwrap();
+    //for p in lin_polys.iter() {
+    //    file.write_all(format!("{}\n", p).as_bytes()).unwrap();
         //println!("{}", p);
-    }
+    //}
     //let mut eqs = LinkedList::new();
     //let mut forward_eqs = LinkedList::new();
     // for (i, p) in lin_polys.iter().enumerate() {
@@ -551,6 +578,7 @@ fn aio_encrypt_eqs<'a, O: MonomialOrdering>(
 }
 
 const MIBS_SBOX: [u8; 16] = [4, 15, 3, 8, 13, 10, 12, 0, 11, 5, 7, 14, 2, 6, 1, 9];
+#[derive(Clone)]
 struct MibsCipher {
     round_keys: [u32; NR],
 }
@@ -675,10 +703,11 @@ struct IntermediateData(FixedBitSet);
 struct Key(FixedBitSet);
 
 trait Cipher: Sized {
+    fn new() -> Self;
     fn set_random_key(&mut self) -> Key;
     fn set_zero_key(&mut self) -> Key;
-    fn generate_forward_sample(&mut self, zz: &[Message], sample: &mut Sample<Self>);
-    fn generate_backward_sample(&mut self, zz: &[Message], sample: &mut Sample<Self>);
+    fn generate_forward_sample(&self, zz: &[Message], sample: &mut Sample<Self>);
+    fn generate_backward_sample(&self, zz: &[Message], sample: &mut Sample<Self>);
     fn block_len() -> usize;
     fn key_len() -> usize;
     fn intermediate_len() -> usize;
@@ -741,6 +770,9 @@ impl<C: Cipher> Sample<C> {
 
 impl Sample<MibsCipher> {}
 impl Cipher for MibsCipher {
+    fn new() -> Self {
+        MibsCipher::new()
+    }
     fn block_len() -> usize {
         64
     }
@@ -789,7 +821,7 @@ impl Cipher for MibsCipher {
         key
     }
 
-    fn generate_forward_sample(&mut self, zz: &[Message], sample: &mut Sample<MibsCipher>) {
+    fn generate_forward_sample(&self, zz: &[Message], sample: &mut Sample<MibsCipher>) {
         sample
             .x
             .resize_with(zz.len(), || Message(FixedBitSet::with_capacity(64)));
@@ -804,7 +836,7 @@ impl Cipher for MibsCipher {
         }
     }
 
-    fn generate_backward_sample(&mut self, zz: &[Message], sample: &mut Sample<MibsCipher>) {
+    fn generate_backward_sample(&self, zz: &[Message], sample: &mut Sample<MibsCipher>) {
         sample.y.clone_from_slice(zz);
         for (i, msg) in zz.iter().enumerate() {
             let mut inter = [0u32; NR];
@@ -841,17 +873,21 @@ fn generate_samples<C: Cipher>(
     samples
 }
 
-fn prone_polynomials<'a, O: MonomialOrdering, C: Cipher>(
+fn prone_polynomials<'a, O: MonomialOrdering, C: Cipher + Sync>(
     list_of_monos: &[Monomial<'a, O>],
-    list_of_samples: &[Sample<C>],
+    is_forward: bool,
+    cipher: &mut C,
+    zz: &[Message],
     print: bool,
     ring: &'a BoxedRing<O>,
 ) -> LinkedList<Polynomial<'a, O>> {
-    let mut rng = &mut rand::thread_rng();
     let dim_samples = list_of_monos.len();
-    let num_samples = ((dim_samples + EXECIVE_SAMPLES + 127) / 128) * 128;
-    let samples = list_of_samples.choose_multiple(&mut rng, num_samples);
-    let mut mat = BinMatrix::zero(dim_samples, dim_samples + num_samples);
+    let num_samples =
+        ((dim_samples + EXECIVE_SAMPLES + PAR_CHUNK_SIZE - 1) / PAR_CHUNK_SIZE) * PAR_CHUNK_SIZE;
+    let mut arc_mat = Arc::new(Mutex::new(BinMatrix::zero(
+        dim_samples,
+        dim_samples + num_samples,
+    )));
     if print {
         eprintln!(
             "Matrix size: {} x {}",
@@ -859,12 +895,29 @@ fn prone_polynomials<'a, O: MonomialOrdering, C: Cipher>(
             dim_samples + num_samples
         );
     }
-    for (i, smp) in samples.enumerate() {
-        for (j, m) in list_of_monos.iter().enumerate() {
-            let v = smp.apply_monomial(m);
-            mat.set_bit(j, i, v);
-        }
-    }
+
+    (0..num_samples / PAR_CHUNK_SIZE)
+        .into_par_iter()
+        .for_each(|ii| {
+            let arc_mat = arc_mat.clone();
+            let mut cipher = C::new();
+            let mut smp = Sample::<C>::new(NM);
+            for iii in 0..PAR_CHUNK_SIZE {
+                let i = ii * PAR_CHUNK_SIZE + iii;
+                smp.key = cipher.set_random_key();
+                if is_forward {
+                    cipher.generate_forward_sample(&zz, &mut smp);
+                } else {
+                    cipher.generate_backward_sample(&zz, &mut smp);
+                }
+                let mut mat = arc_mat.lock().unwrap();
+                for (j, m) in list_of_monos.iter().enumerate() {
+                    let v = smp.apply_monomial(m);
+                    mat.set_bit(j, i, v);
+                }
+            }
+        });
+    let mut mat = arc_mat.lock().unwrap();
     let mat_time = SystemTime::now();
 
     for i in 0..dim_samples {
@@ -900,20 +953,22 @@ fn prone_polynomials<'a, O: MonomialOrdering, C: Cipher>(
     res
 }
 
-fn all_lin_analysis_rbyr_chunk<'a, O: MonomialOrdering, C: Cipher>(
-    list_of_samples: &[Sample<C>],
+fn all_lin_analysis_rbyr_chunk<'a, O: MonomialOrdering, C: Cipher + Clone + Sync>(
+    cipher: &mut C,
+    zz: &[Message],
+    is_forward: bool,
     vars_l: &Vec<Vec<Vec<Monomial<'a, O>>>>,
     excluded_mons: &BTreeSet<Monomial<'a, O>>,
     print: bool,
     ring: &'a BoxedRing<O>,
     chunk_size: usize,
-) -> (LinkedList<Polynomial<'a, O>>,Vec<usize>) {
+) -> (LinkedList<Polynomial<'a, O>>, Vec<usize>) {
     let tot_time = SystemTime::now();
     let mut vars = Vec::new();
     let mut eqs = LinkedList::new();
     let num_chunks = (NM + chunk_size - 1) / chunk_size;
     let mut num_found_pols = Vec::new();
-    num_found_pols.resize(NR,0);
+    num_found_pols.resize(NR, 0);
     for i in LIN_ANALYSIS_START_ROUND..=LIN_ANALYSIS_LAST_ROUND {
         for kk in 0..num_chunks {
             let time = SystemTime::now();
@@ -929,13 +984,13 @@ fn all_lin_analysis_rbyr_chunk<'a, O: MonomialOrdering, C: Cipher>(
             vars.sort();
             vars.reverse();
 
-            let mut teqs = prone_polynomials::<O, C>(&vars, list_of_samples, print, ring);
+            let mut teqs = prone_polynomials::<O, C>(&vars, is_forward, cipher, zz, print, ring);
             let new_pols = teqs.len();
             for p in teqs {
                 //excluded_mons.insert(p.lm().clone());
                 eqs.push_back(p);
             }
-            num_found_pols[i]+=new_pols;
+            num_found_pols[i] += new_pols;
 
             if print {
                 eprintln!("---------");
@@ -959,11 +1014,13 @@ fn all_lin_analysis_rbyr_chunk<'a, O: MonomialOrdering, C: Cipher>(
         eprintln!("---------");
     }
 
-    (eqs,num_found_pols)
+    (eqs, num_found_pols)
 }
 
-fn all_lin_analysis_rbyr<'a, O: MonomialOrdering, C: Cipher>(
-    list_of_samples: &[Sample<C>],
+fn all_lin_analysis_rbyr<'a, O: MonomialOrdering, C: Cipher + Clone + Sync>(
+    cipher: &mut C,
+    zz: &[Message],
+    is_forward: bool,
     vars_l: &Vec<Vec<Vec<Monomial<'a, O>>>>,
     excluded_mons: &BTreeSet<Monomial<'a, O>>,
     print: bool,
@@ -986,7 +1043,7 @@ fn all_lin_analysis_rbyr<'a, O: MonomialOrdering, C: Cipher>(
         vars.sort();
         vars.reverse();
 
-        let mut teqs = prone_polynomials::<O, C>(&vars, list_of_samples, print, ring);
+        let mut teqs = prone_polynomials::<O, C>(&vars, is_forward, cipher, zz, print, ring);
         let new_pols = teqs.len();
         for p in teqs {
             //excluded_mons.insert(p.lm().clone());
@@ -1017,12 +1074,13 @@ fn all_lin_analysis_rbyr<'a, O: MonomialOrdering, C: Cipher>(
     eqs
 }
 
-fn all_lin_analysis_tot<'a, O: 'a + MonomialOrdering, C: Cipher>(
-    list_of_samples: &[Sample<C>],
+fn all_lin_analysis_tot<'a, O: 'a + MonomialOrdering, C: Cipher + Clone + Sync>(
+    cipher: &mut C,
+    zz: &[Message],
+    is_forward: bool,
     vars_l: &[Vec<Vec<Monomial<'a, O>>>],
     excluded_mons: &BTreeSet<Monomial<'a, O>>,
     print: bool,
-    cipher: &mut C,
     ring: &'a BoxedRing<O>,
 ) -> LinkedList<Polynomial<'a, O>> {
     let tot_time = SystemTime::now();
@@ -1039,7 +1097,7 @@ fn all_lin_analysis_tot<'a, O: 'a + MonomialOrdering, C: Cipher>(
     vars.push(Monomial::one(ring));
     vars.sort();
     vars.reverse();
-    let eqs = prone_polynomials::<O, C>(&vars, list_of_samples, print, ring);
+    let eqs = prone_polynomials::<O, C>(&vars, is_forward, cipher, zz, print, ring);
 
     if print {
         eprintln!("---------");
